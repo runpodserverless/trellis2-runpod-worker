@@ -1,0 +1,7 @@
+{
+  "input": {
+    "image_base64": "REPLACE_WITH_A_REAL_BASE64_PNG_STRING",
+    "output_compression": "gzip",
+    "simplify_target": 16777216
+  }
+}

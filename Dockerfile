@@ -1,0 +1,84 @@
+# TRELLIS.2 — RunPod Serverless worker
+#
+# Requirements (from the official repo, github.com/microsoft/TRELLIS.2):
+#   - CUDA 12.4
+#   - NVIDIA GPU with >= 24GB VRAM (validated on A100/H100; RTX 4090 works fine)
+#   - Linux only
+#
+# Design choices:
+#   - Base image is nvidia/cuda:12.4.0-devel so the CUDA toolkit needed to
+#     compile flash-attn/nvdiffrast/cumesh (native extensions) is present.
+#   - We install into a conda env named "trellis2", matching the official
+#     setup.sh so any troubleshooting advice from the upstream repo still
+#     applies verbatim.
+#   - Model weights are downloaded at BUILD time (not at container start).
+#     RunPod Serverless spins up fresh containers on cold start; downloading
+#     ~8GB of weights on every cold start would make first-request latency
+#     unacceptable. Baking them into the image trades a larger image (slower
+#     initial push/pull, one time) for much faster cold starts (every request
+#     after that).
+
+FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CUDA_HOME=/usr/local/cuda-12.4
+ENV PATH=/opt/conda/bin:$PATH
+
+# --- System dependencies ---------------------------------------------------
+RUN apt-get update && apt-get install -y \
+    git wget curl build-essential ninja-build \
+    python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Miniconda (the repo recommends conda for dependency management) -------
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh \
+    && bash /tmp/miniconda.sh -b -p /opt/conda \
+    && rm /tmp/miniconda.sh
+
+WORKDIR /workspace
+
+# --- Clone TRELLIS.2 with submodules ----------------------------------------
+# --recursive is not optional: the repo uses git submodules for some of its
+# rendering dependencies. Forgetting it produces cryptic import errors much
+# later in the build, not a clear "submodule missing" message.
+RUN git clone -b main https://github.com/microsoft/TRELLIS.2.git --recursive
+WORKDIR /workspace/TRELLIS.2
+
+# --- Install dependencies via the official setup script ---------------------
+# Flags match the ones documented in the repo's README:
+#   --new-env      : create the "trellis2" conda env
+#   --basic        : core Python dependencies (torch 2.6.0 + CUDA 12.4, etc.)
+#   --flash-attn   : attention backend (fast path; skip + use xformers on
+#                    GPUs that don't support it, e.g. V100 — not relevant for
+#                    RunPod's A100/H100/RTX 4090 offerings)
+#   --nvdiffrast, --nvdiffrec, --cumesh, --o-voxel, --flexgemm :
+#                    rendering / mesh-processing extensions the pipeline
+#                    needs for texture baking and mesh export
+# This step is slow (native extensions compiled from source) — expect
+# 20-40 minutes on a typical CI runner.
+RUN . ./setup.sh --new-env --basic --flash-attn --nvdiffrast --nvdiffrec --cumesh --o-voxel --flexgemm
+
+# --- RunPod SDK + our own worker dependencies -------------------------------
+# Installed into the trellis2 env specifically, not the base Python, so the
+# handler can import trellis2's own modules directly.
+RUN /opt/conda/envs/trellis2/bin/pip install --no-cache-dir \
+    runpod \
+    pillow \
+    requests \
+    huggingface_hub
+
+# --- Pre-download model weights at build time -------------------------------
+# microsoft/TRELLIS.2-4B is a public model; no HF token required. This layer
+# is the main reason the image is large, and the main reason cold starts
+# stay fast: the alternative is an 8GB+ download on every fresh worker.
+RUN /opt/conda/envs/trellis2/bin/python3 -c "\
+from huggingface_hub import snapshot_download; \
+snapshot_download(repo_id='microsoft/TRELLIS.2-4B')"
+
+# --- Worker code -------------------------------------------------------------
+COPY handler.py /workspace/TRELLIS.2/handler.py
+COPY test_input.json /workspace/TRELLIS.2/test_input.json
+
+# RunPod's serverless harness expects the container's default command to
+# start the handler loop directly — no shell prompt, no server framework.
+ENTRYPOINT ["/opt/conda/envs/trellis2/bin/python3", "-u", "handler.py"]
