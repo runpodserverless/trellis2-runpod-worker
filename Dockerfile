@@ -90,7 +90,27 @@ ENV FORCE_CUDA=1
 # tail is a hard checkpoint: if setup.sh didn't actually create the
 # "trellis2" env, the build fails right here with a clear message instead
 # of a mystifying "exit code 127" two steps later on the pip install.
-RUN bash ./setup.sh --new-env --basic --flash-attn --nvdiffrast --nvdiffrec --cumesh --o-voxel --flexgemm \
+# Recent conda requires explicitly accepting the default channels' Terms of
+# Service before `conda create` will work non-interactively — otherwise it
+# fails with CondaToSNonInteractiveError, setup.sh's `set -e`-less script
+# swallows that failure, and every install that follows silently lands in
+# the base env (Python 3.14) instead of the "trellis2" env (Python 3.10)
+# setup.sh is trying to create, which cascades into wrong/unpinned package
+# versions further down. Accepting the ToS up front avoids that entirely.
+RUN conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main \
+    && conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
+# `conda activate` only works in a shell where conda's hook has been
+# sourced first — a bare `conda activate` in a fresh non-interactive shell
+# fails with "Run 'conda init' before 'conda activate'". We source the hook
+# and then *source* setup.sh (`. ./setup.sh`, matching the upstream repo's
+# own documented invocation) in that same shell, rather than running it as
+# `bash ./setup.sh`: the script uses `return` in a couple of places, which
+# is only valid when sourced, and sourcing also lets `conda activate`
+# inside it inherit the hook we just loaded instead of failing again in a
+# fresh subprocess shell.
+RUN source /opt/conda/etc/profile.d/conda.sh \
+    && . ./setup.sh --new-env --basic --flash-attn --nvdiffrast --nvdiffrec --cumesh --o-voxel --flexgemm \
     && test -x /opt/conda/envs/trellis2/bin/pip \
     && conda env list
 
