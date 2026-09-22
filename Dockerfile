@@ -52,6 +52,24 @@ WORKDIR /workspace
 RUN git clone -b main https://github.com/microsoft/TRELLIS.2.git --recursive
 WORKDIR /workspace/TRELLIS.2
 
+# --- Patch: DINOv3 layer-nesting mismatch -----------------------------------
+# Known upstream bug (see visualbruno/ComfyUI-Trellis2 issues #142 and #144).
+# image_feature_extractor.py assumes a DINOv2-style model layout
+# (self.model.layer), but the DINOv3 checkpoint TRELLIS.2 actually loads
+# (facebook/dinov3-vitl16-pretrain-lvd1689m) nests its transformer blocks one
+# level deeper, at self.model.model.layer. Without this patch, EVERY
+# generation fails at inference time with:
+#   AttributeError: 'DINOv3ViTModel' object has no attribute 'layer'
+# — the build and cold start both succeed, so this only surfaces on the
+# first real request, which is exactly what happened when we tested this
+# worker on RunPod. Patched here (post-clone, pre-setup.sh) rather than by
+# hand-editing a file that git clone will just overwrite on the next build.
+RUN sed -i 's/self\.model\.layer/self.model.model.layer/' \
+    trellis2/modules/image_feature_extractor.py \
+    && grep -q "self.model.model.layer" trellis2/modules/image_feature_extractor.py \
+    && echo "DINOv3 patch applied successfully" \
+    || (echo "DINOv3 patch FAILED — file contents may have changed upstream, check manually" && exit 1)
+
 # --- Install dependencies via the official setup script ---------------------
 # Flags match the ones documented in the repo's README:
 #   --new-env      : create the "trellis2" conda env
