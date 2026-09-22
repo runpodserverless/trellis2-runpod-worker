@@ -20,6 +20,14 @@
 
 FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
 
+# Docker's default RUN shell is "/bin/sh -c", which on Ubuntu is dash, not
+# bash. The upstream setup.sh is written for bash. Sourcing it under dash
+# (the original bug here) can silently swallow a failed `conda create`
+# instead of failing the build — the env never gets created, and the next
+# RUN step dies later with a confusing "exit code 127". Forcing bash for
+# every RUN in this file removes that whole class of failure.
+SHELL ["/bin/bash", "-c"]
+
 ENV DEBIAN_FRONTEND=noninteractive
 ENV CUDA_HOME=/usr/local/cuda-12.4
 ENV PATH=/opt/conda/bin:$PATH
@@ -56,7 +64,15 @@ WORKDIR /workspace/TRELLIS.2
 #                    needs for texture baking and mesh export
 # This step is slow (native extensions compiled from source) — expect
 # 20-40 minutes on a typical CI runner.
-RUN . ./setup.sh --new-env --basic --flash-attn --nvdiffrast --nvdiffrec --cumesh --o-voxel --flexgemm
+#
+# Run with `bash` (not `. `/source, and not the default dash shell) so any
+# internal failure actually propagates. The `test -x ... && conda env list`
+# tail is a hard checkpoint: if setup.sh didn't actually create the
+# "trellis2" env, the build fails right here with a clear message instead
+# of a mystifying "exit code 127" two steps later on the pip install.
+RUN bash ./setup.sh --new-env --basic --flash-attn --nvdiffrast --nvdiffrec --cumesh --o-voxel --flexgemm \
+    && test -x /opt/conda/envs/trellis2/bin/pip \
+    && conda env list
 
 # --- RunPod SDK + our own worker dependencies -------------------------------
 # Installed into the trellis2 env specifically, not the base Python, so the
