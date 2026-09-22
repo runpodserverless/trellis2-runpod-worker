@@ -65,6 +65,26 @@ WORKDIR /workspace/TRELLIS.2
 # This step is slow (native extensions compiled from source) — expect
 # 20-40 minutes on a typical CI runner.
 #
+# GitHub-hosted runners (ubuntu-latest) have no NVIDIA driver at all, so
+# setup.sh's own platform check — `command -v nvidia-smi` — fails instantly
+# and the script exits before installing anything (this is what produced
+# "Error: No supported GPU found"). That check only cares whether the
+# *command* exists, not whether a GPU is attached, so a minimal stub is
+# enough to get past it. The actual compilation (nvcc, flash-attn,
+# nvdiffrast, cumesh) doesn't need a live device — the CUDA Toolkit is
+# already in this base image — as long as we tell it explicitly which
+# architectures to build for instead of letting it try to auto-detect one.
+RUN printf '#!/bin/sh\ncase "$*" in\n  *--query-gpu*) echo "A100-SXM4-80GB, 81920" ;;\n  *) echo "Stub nvidia-smi (no physical GPU on this build host)" ;;\nesac\nexit 0\n' \
+    > /usr/local/bin/nvidia-smi \
+    && chmod +x /usr/local/bin/nvidia-smi
+
+# A100=8.0, A6000/3090=8.6, RTX 4090=8.9, H100=9.0 — covers the GPUs named
+# in the README. FORCE_CUDA=1 stops PyTorch's cpp_extension build tooling
+# from skipping the CUDA build when torch.cuda.is_available() is False
+# (which it always is here, since there's no device — only a stub).
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
+ENV FORCE_CUDA=1
+
 # Run with `bash` (not `. `/source, and not the default dash shell) so any
 # internal failure actually propagates. The `test -x ... && conda env list`
 # tail is a hard checkpoint: if setup.sh didn't actually create the
