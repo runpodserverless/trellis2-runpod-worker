@@ -127,10 +127,33 @@ RUN conda tos accept --override-channels --channel https://repo.anaconda.com/pkg
 # is only valid when sourced, and sourcing also lets `conda activate`
 # inside it inherit the hook we just loaded instead of failing again in a
 # fresh subprocess shell.
+#
+# --flash-attn is deliberately OMITTED here. setup.sh's flash-attn install
+# compiles from source, and that compile is a well-documented OOM risk on
+# constrained build hosts (GitHub Actions' standard runners have ~7GB RAM;
+# see e.g. h2oai/h2o-llmstudio#1096, "stop building flash-attn in CI, which
+# OOM-killed the runners"). We saw this ourselves: the build completed
+# "successfully" but flash_attn silently never got installed, and the
+# failure only surfaced at inference time on RunPod as
+# "ModuleNotFoundError: No module named 'flash_attn'" — the exact class of
+# failure our post-setup.sh checkpoint below exists to catch at build time
+# instead. We install a prebuilt wheel afterward instead of compiling.
 RUN source /opt/conda/etc/profile.d/conda.sh \
-    && . ./setup.sh --new-env --basic --flash-attn --nvdiffrast --nvdiffrec --cumesh --o-voxel --flexgemm \
+    && . ./setup.sh --new-env --basic --nvdiffrast --nvdiffrec --cumesh --o-voxel --flexgemm \
     && test -x /opt/conda/envs/trellis2/bin/pip \
     && conda env list
+
+# --- flash-attn: prebuilt wheel, not a source compile ----------------------
+# Official Dao-AILab release, matching this image's exact stack: CUDA 12.x,
+# torch 2.6 (installed by setup.sh's --basic), Python 3.10 (the version
+# --new-env creates), cxx11abiFALSE (the ABI official pip-distributed torch
+# wheels use). Swap this URL if setup.sh's pinned torch/Python version ever
+# changes upstream — a mismatched ABI or torch version fails at import time,
+# which is exactly why we verify immediately below rather than trusting the
+# pip install exit code alone.
+RUN /opt/conda/envs/trellis2/bin/pip install --no-cache-dir \
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1%2Bcu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl" \
+    && /opt/conda/envs/trellis2/bin/python3 -c "import flash_attn; print('flash-attn', flash_attn.__version__, 'OK')"
 
 # --- RunPod SDK + our own worker dependencies -------------------------------
 # Installed into the trellis2 env specifically, not the base Python, so the
