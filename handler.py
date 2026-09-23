@@ -12,7 +12,15 @@ Input (job["input"]):
     simplify_target : int, optional. Passed to mesh.simplify(); the repo's
                       own example caps this at 16_777_216 (nvdiffrast's
                       internal limit) — we default to that ceiling and clamp
-                      any caller-supplied value to it.
+                      any caller-supplied value to it. This operates on the
+                      O-Voxel structure itself, before export.
+    decimation_target : int, optional, default 50_000. Passed to
+                      o_voxel.postprocess.to_glb() — controls the vertex
+                      count of the *final exported GLB mesh*. This is a
+                      separate, much smaller number than simplify_target;
+                      matches the repo's own official usage example.
+    texture_size    : int, optional, default 2048. Texture resolution baked
+                      into the exported GLB, also passed to to_glb().
 
 Output:
     {"status": "success", "glb_gzip_base64": "..."}         (default)
@@ -34,6 +42,12 @@ Design notes:
     - We explicitly refuse to return a payload over a preventive size
       ceiling rather than letting a huge JSON blob potentially get truncated
       or rejected upstream with a less useful error.
+    - pipeline.run(image)[0] returns a MeshWithVoxel object. It has
+      .simplify() but NOT .export() — that was the bug that produced
+      "'MeshWithVoxel' object has no attribute 'export'". Per the repo's
+      own official example, exporting to GLB requires first converting via
+      o_voxel.postprocess.to_glb(...), and it's THAT returned object which
+      has .export(). See _export_glb() below.
 """
 
 import base64
@@ -52,6 +66,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch
 from PIL import Image
 
+import o_voxel
 from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
 _pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
@@ -62,6 +77,13 @@ print("[trellis2-worker] Pipeline loaded and moved to GPU. Ready for jobs.")
 # nvdiffrast's internal vertex-count ceiling; mirrors the value used in the
 # model card's own minimal example (mesh.simplify(16_777_216)).
 _MESH_SIMPLIFY_CEILING = 16_777_216
+
+# Defaults for the GLB export step (o_voxel.postprocess.to_glb), matching
+# the repo's own official usage example. decimation_target controls the
+# *exported* mesh's vertex count — a much smaller number than
+# simplify_target, which operates on the O-Voxel structure beforehand.
+_DEFAULT_DECIMATION_TARGET = 50_000
+_DEFAULT_TEXTURE_SIZE = 2048
 
 # Same preventive payload ceiling pattern used by other RunPod 3D workers in
 # this space: reject an oversized output explicitly rather than emitting a
@@ -89,19 +111,47 @@ def _decode_input_image(image_base64: str) -> Image.Image:
         os.unlink(tmp_path)
 
 
-def _export_glb(mesh, simplify_target: int) -> bytes:
-    """Run mesh simplification and export to GLB bytes via a temp file.
+def _export_glb(
+    mesh,
+    simplify_target: int,
+    decimation_target: int = _DEFAULT_DECIMATION_TARGET,
+    texture_size: int = _DEFAULT_TEXTURE_SIZE,
+) -> bytes:
+    """Run mesh simplification, convert to a real exportable GLB, and
+    return its bytes via a temp file.
 
-    TRELLIS.2's mesh object writes to a filepath rather than returning bytes
-    directly, so we round-trip through a temp file and read it back — this
-    mirrors the pattern in the model's own official usage example.
+    Two distinct steps, both required (this mirrors the repo's own official
+    usage example — see the module docstring):
+      1. mesh.simplify(simplify_target) — operates on the MeshWithVoxel /
+         O-Voxel structure itself. MeshWithVoxel has this method but NOT
+         .export().
+      2. o_voxel.postprocess.to_glb(...) — converts that O-Voxel structure
+         into an actual exportable mesh (cleaning, remeshing, UV unwrap,
+         texture baking). The OBJECT THIS RETURNS is what has .export().
     """
     target = min(int(simplify_target), _MESH_SIMPLIFY_CEILING)
     mesh.simplify(target)
+
+    glb = o_voxel.postprocess.to_glb(
+        vertices=mesh.vertices,
+        faces=mesh.faces,
+        attr_volume=mesh.attrs,
+        coords=mesh.coords,
+        attr_layout=mesh.layout,
+        voxel_size=mesh.voxel_size,
+        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+        decimation_target=decimation_target,
+        texture_size=texture_size,
+        remesh=True,
+        remesh_band=1,
+        remesh_project=0,
+        verbose=False,
+    )
+
     with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as tmp:
         tmp_path = tmp.name
     try:
-        mesh.export(tmp_path)
+        glb.export(tmp_path, extension_webp=True)
         with open(tmp_path, "rb") as f:
             return f.read()
     finally:
@@ -119,6 +169,8 @@ def handler(job):
 
         compression = (job_input.get("output_compression") or "gzip").lower()
         simplify_target = job_input.get("simplify_target", _MESH_SIMPLIFY_CEILING)
+        decimation_target = job_input.get("decimation_target", _DEFAULT_DECIMATION_TARGET)
+        texture_size = job_input.get("texture_size", _DEFAULT_TEXTURE_SIZE)
 
         image = _decode_input_image(image_base64)
 
@@ -129,7 +181,7 @@ def handler(job):
             return {"status": "error", "message": "Pipeline produced no output for this image"}
 
         mesh = outputs[0]
-        glb_bytes = _export_glb(mesh, simplify_target)
+        glb_bytes = _export_glb(mesh, simplify_target, decimation_target, texture_size)
 
         if compression == "none":
             payload_bytes = base64.b64encode(glb_bytes)
@@ -144,7 +196,7 @@ def handler(job):
                 "message": (
                     f"Generated GLB is too large to return "
                     f"({len(payload_bytes)} bytes, limit {_MAX_OUTPUT_BYTES}). "
-                    "Try a lower simplify_target."
+                    "Try a lower decimation_target."
                 ),
             }
 
